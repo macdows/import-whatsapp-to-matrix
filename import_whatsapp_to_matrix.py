@@ -61,7 +61,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Lines may start with Unicode LTR mark \u200e
 LINE_RE = re.compile(
     r"^\u200e?\[(\d{2}/\d{2}/\d{4}),\s(\d{2}:\d{2}:\d{2})\]\s"
-    r"(~?[^:]+?):\s(.*)"
+    r"~?([^:]+?):\s(.*)"
 )
 
 # Attachment tag, possibly preceded by Unicode LTR mark
