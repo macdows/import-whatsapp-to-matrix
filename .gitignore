@@ -209,3 +209,5 @@ __marimo__/
 .claude/settings.local.json
 .claude/todos.*
 .claude/worktrees/
+
+import_progress.json

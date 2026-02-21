@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -342,11 +343,11 @@ class MatrixAPI:
     def set_direct_room(self, owner_mxid: str, ghost_mxid: str,
                         room_id: str) -> None:
         """Update m.direct account data so Element shows the room as a DM."""
-        admin_base = f"{self.base}/_synapse/admin/v1"
-        url = f"{admin_base}/users/{owner_mxid}/accountdata/global/m.direct"
+        encoded_owner = urllib.parse.quote(owner_mxid)
+        path = f"/user/{encoded_owner}/account_data/m.direct"
 
-        # Fetch current m.direct mappings
-        resp = self.session.get(url, timeout=30)
+        # Fetch current m.direct mappings (impersonate the owner)
+        resp = self._request("GET", path, params={"user_id": owner_mxid})
         if resp.status_code == 200:
             direct = resp.json()
         elif resp.status_code == 404:
@@ -362,7 +363,8 @@ class MatrixAPI:
         direct[ghost_mxid] = rooms
 
         # Save updated mappings
-        resp = self.session.put(url, json=direct, timeout=30)
+        resp = self._request("PUT", path, params={"user_id": owner_mxid},
+                             json_body=direct)
         if resp.status_code == 200:
             print(f"  Set m.direct for {owner_mxid}: {ghost_mxid} → {room_id}")
         else:
@@ -618,9 +620,11 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
             invite=[ghost_mxid],
         )
         api.join_room(room_id, ghost_mxid)
-        api.set_direct_room(args.owner_mxid, ghost_mxid, room_id)
         progress["room_id"] = room_id
         save_progress(progress)
+
+    # Always set m.direct so re-runs fix the DM flag too
+    api.set_direct_room(args.owner_mxid, ghost_mxid, room_id)
 
     # Step 3: Send messages
     print(f"\n[3/4] Sending {len(messages)} messages...")
