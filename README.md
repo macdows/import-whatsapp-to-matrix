@@ -52,7 +52,7 @@ This prints a YAML registration file and setup instructions for your homeserver.
 ```bash
 export MATRIX_AS_TOKEN='<as_token from the generated YAML>'
 export HOMESERVER_URL='https://matrix.example.com'
-export OWNER_MXID='@malo:example.com'
+export OWNER_MXID='@user:example.com'
 export SERVER_NAME='example.com'
 ```
 
@@ -72,7 +72,7 @@ python import_whatsapp_to_matrix.py
 
 The script will:
 
-1. Register the ghost user (`@hogan_laundry:example.com`)
+1. Register the ghost user (`@whatsapp_ghost:example.com`)
 2. Create a private DM room (or reuse an existing one)
 3. Send all messages with original timestamps
 4. Save progress after each message
@@ -87,18 +87,21 @@ All options can be set via CLI flags or environment variables:
 | `--as-token` | `MATRIX_AS_TOKEN` | — | Appservice access token (required) |
 | `--owner-mxid` | `OWNER_MXID` | — | Your Matrix user ID (required) |
 | `--server-name` | `SERVER_NAME` | — | Matrix server name (required) |
-| `--ghost-localpart` | `GHOST_LOCALPART` | `hogan_laundry` | Localpart for the ghost user |
-| `--timezone` | `TIMEZONE` | `Asia/Makassar` | Timezone for chat timestamps |
+| `--ghost-localpart` | `GHOST_LOCALPART` | `whatsapp_ghost` | Localpart for the ghost user |
+| `--timezone` | `TIMEZONE` | `Europe/London` | Timezone for chat timestamps |
 | `--room-id` | `MATRIX_ROOM_ID` | — | Import into an existing room |
 | `--chat-dir` | `CHAT_DIR` | Script directory | Path to WhatsApp chat export folder |
+| `--owner-name` | `OWNER_NAME` | Auto-detected | WhatsApp display name of the room owner |
+| `--ghost-name` | `GHOST_NAME` | Auto-detected | WhatsApp display name of the other party |
 | `--dry-run` | — | — | Parse only, don't send |
+| `--fresh` | — | — | Delete progress and start a fresh import |
 | `--generate-config` | — | — | Print appservice YAML and exit |
 
 ## Resuming an interrupted import
 
 Progress is saved to `import_progress.json` after each message. Re-running the script will skip already-sent messages and continue where it left off.
 
-To start fresh, delete `import_progress.json`.
+To start fresh, re-run with `--fresh` to delete the progress file and create a new room.
 
 ## Note on encryption
 
@@ -106,4 +109,4 @@ Imported messages are **not end-to-end encrypted**, even if you normally use an 
 
 ## Adapting for other chats
 
-The sender map is hardcoded in `build_sender_map()`. To import a different chat, update the sender names and ghost localpart to match your export.
+Sender names are auto-detected when the chat has exactly two participants. For chats with more senders, specify `--owner-name` and `--ghost-name` explicitly. Adjust `--ghost-localpart` to set the Matrix localpart for the ghost user.
