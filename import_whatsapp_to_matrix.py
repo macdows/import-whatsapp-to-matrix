@@ -87,6 +87,10 @@ def parse_args():
         help="Parse and display messages without sending to Matrix"
     )
     parser.add_argument(
+        "--fresh", action="store_true",
+        help="Delete import_progress.json and start a fresh import"
+    )
+    parser.add_argument(
         "--generate-config", action="store_true",
         help="Print appservice YAML and playbook instructions, then exit"
     )
@@ -321,11 +325,10 @@ class MatrixAPI:
         else:
             print(f"  Warning: set displayname returned {resp.status_code}: {resp.text}")
 
-    def create_room(self, creator_user_id: str, name: str,
+    def create_room(self, creator_user_id: str, name: str | None = None,
                     invite: list[str] = None) -> str:
         """Create a room as the given user. Returns room_id."""
         body = {
-            "name": name,
             "visibility": "private",
             "preset": "private_chat",
             "is_direct": True,
@@ -333,6 +336,8 @@ class MatrixAPI:
                 "m.federate": False,
             },
         }
+        if name:
+            body["name"] = name
         if invite:
             body["invite"] = invite
 
@@ -632,7 +637,6 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
         # appservice can only act as users in its own namespace.
         room_id = api.create_room(
             creator_user_id=args.owner_mxid,
-            name=f"{ghost_name} (WhatsApp Import)",
             invite=[ghost_mxid],
         )
         api.join_room(room_id, ghost_mxid)
@@ -732,6 +736,10 @@ def main():
     chat_dir = Path(args.chat_dir).resolve()
     chat_file = chat_dir / "_chat.txt"
     progress_file = chat_dir / "import_progress.json"
+
+    if args.fresh and progress_file.exists():
+        progress_file.unlink()
+        print("  Cleared previous import progress (--fresh)")
 
     # Parse chat
     print(f"Parsing {chat_file}...")
