@@ -28,10 +28,16 @@ pip install requests Pillow
 
 ### 1. Prepare the chat export
 
-Export the WhatsApp chat (with media) and place the files in this directory. The script expects:
+Export the WhatsApp chat (with media). The folder should contain:
 
 - `_chat.txt` — the chat transcript
 - Any attached media files referenced in the transcript (e.g. `IMG-20240101-WA0001.jpg`)
+
+By default the script looks for these files in its own directory. To target a different folder, use `--chat-dir`:
+
+```bash
+python import_whatsapp_to_matrix.py --chat-dir "/path/to/WhatsApp Chat - Someone" --dry-run
+```
 
 ### 2. Generate the appservice registration
 
@@ -84,6 +90,7 @@ All options can be set via CLI flags or environment variables:
 | `--ghost-localpart` | `GHOST_LOCALPART` | `hogan_laundry` | Localpart for the ghost user |
 | `--timezone` | `TIMEZONE` | `Asia/Makassar` | Timezone for chat timestamps |
 | `--room-id` | `MATRIX_ROOM_ID` | — | Import into an existing room |
+| `--chat-dir` | `CHAT_DIR` | Script directory | Path to WhatsApp chat export folder |
 | `--dry-run` | — | — | Parse only, don't send |
 | `--generate-config` | — | — | Print appservice YAML and exit |
 
