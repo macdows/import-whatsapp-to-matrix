@@ -458,7 +458,6 @@ def generate_appservice_config(server_name: str, ghost_localpart: str,
     as_token = secrets.token_hex(32)
     hs_token = secrets.token_hex(32)
 
-    escaped_server = server_name.replace(".", "\\\\.")
     owner_localpart = owner_mxid.split(":")[0].lstrip("@") if owner_mxid else "USER"
     yaml_content = f"""# Application Service registration for WhatsApp import
 # Place this file on your server and register it with Synapse
@@ -471,9 +470,9 @@ sender_localpart: _whatsapp_import
 namespaces:
   users:
     - exclusive: false
-      regex: '@{owner_localpart}:{escaped_server}'
+      regex: "@{owner_localpart}:{server_name}"
     - exclusive: true
-      regex: '@{ghost_localpart}:{escaped_server}'
+      regex: "@{ghost_localpart}:{server_name}"
   rooms: []
   aliases: []
 rate_limited: false
