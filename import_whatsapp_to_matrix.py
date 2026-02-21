@@ -18,9 +18,11 @@ Environment variables:
     HOMESERVER_URL    - Matrix homeserver URL (default: http://localhost:8008)
     OWNER_MXID        - Your Matrix user ID (e.g. @user:example.com)
     SERVER_NAME       - Matrix server name (e.g. example.com)
-    GHOST_LOCALPART   - Localpart for the ghost user (default: hogan_laundry)
-    TIMEZONE          - Timezone for timestamps (default: Asia/Makassar)
+    GHOST_LOCALPART   - Localpart for the ghost user (default: whatsapp_ghost)
+    TIMEZONE          - Timezone for timestamps (default: Europe/London)
     CHAT_DIR          - Path to WhatsApp chat export folder (default: script directory)
+    OWNER_NAME        - WhatsApp display name of the room owner
+    GHOST_NAME        - WhatsApp display name of the other party
 """
 
 from __future__ import annotations
@@ -101,7 +103,7 @@ def parse_args():
     parser.add_argument(
         "--owner-mxid",
         default=os.environ.get("OWNER_MXID"),
-        help="Your Matrix user ID, e.g. @malo:example.com"
+        help="Your Matrix user ID, e.g. @user:example.com"
     )
     parser.add_argument(
         "--server-name",
@@ -110,13 +112,13 @@ def parse_args():
     )
     parser.add_argument(
         "--ghost-localpart",
-        default=os.environ.get("GHOST_LOCALPART", "hogan_laundry"),
-        help="Localpart for the ghost user (default: hogan_laundry)"
+        default=os.environ.get("GHOST_LOCALPART", "whatsapp_ghost"),
+        help="Localpart for the ghost user (default: whatsapp_ghost)"
     )
     parser.add_argument(
         "--timezone",
-        default=os.environ.get("TIMEZONE", "Asia/Makassar"),
-        help="Timezone for chat timestamps (default: Asia/Makassar)"
+        default=os.environ.get("TIMEZONE", "Europe/London"),
+        help="Timezone for chat timestamps (default: Europe/London)"
     )
     parser.add_argument(
         "--room-id",
@@ -127,6 +129,16 @@ def parse_args():
         "--chat-dir",
         default=os.environ.get("CHAT_DIR", str(SCRIPT_DIR)),
         help="Path to WhatsApp chat export folder (default: script directory)"
+    )
+    parser.add_argument(
+        "--owner-name",
+        default=os.environ.get("OWNER_NAME"),
+        help="WhatsApp display name of the room owner (your name in the export)"
+    )
+    parser.add_argument(
+        "--ghost-name",
+        default=os.environ.get("GHOST_NAME"),
+        help="WhatsApp display name of the other party (mapped to the ghost user)"
     )
     return parser.parse_args()
 
@@ -150,8 +162,8 @@ TIMEZONE_OFFSETS = {
 def get_tz_offset(tz_name: str) -> timedelta:
     if tz_name in TIMEZONE_OFFSETS:
         return TIMEZONE_OFFSETS[tz_name]
-    print(f"Warning: Unknown timezone '{tz_name}', defaulting to Asia/Makassar (UTC+8)")
-    return timedelta(hours=8)
+    print(f"Warning: Unknown timezone '{tz_name}', defaulting to Europe/London (UTC+0)")
+    return timedelta(hours=0)
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +447,14 @@ class MatrixAPI:
 # Appservice config generation
 # ---------------------------------------------------------------------------
 
-def generate_appservice_config(server_name: str, ghost_localpart: str):
+def generate_appservice_config(server_name: str, ghost_localpart: str,
+                               owner_mxid: str | None = None):
     import secrets
     as_token = secrets.token_hex(32)
     hs_token = secrets.token_hex(32)
 
     escaped_server = server_name.replace(".", "\\\\.")
+    owner_localpart = owner_mxid.split(":")[0].lstrip("@") if owner_mxid else "USER"
     yaml_content = f"""# Application Service registration for WhatsApp import
 # Place this file on your server and register it with Synapse
 
@@ -452,7 +466,7 @@ sender_localpart: _whatsapp_import
 namespaces:
   users:
     - exclusive: false
-      regex: '@malo:{escaped_server}'
+      regex: '@{owner_localpart}:{escaped_server}'
     - exclusive: true
       regex: '@{ghost_localpart}:{escaped_server}'
   rooms: []
@@ -491,7 +505,7 @@ rate_limited: false
     print("4. Set the environment variable and run this script:")
     print(f"     export MATRIX_AS_TOKEN='{as_token}'")
     print(f"     export HOMESERVER_URL='https://matrix.YOURDOMAIN.com'")
-    print(f"     export OWNER_MXID='@malo:{server_name}'")
+    print(f"     export OWNER_MXID='@{owner_localpart}:{server_name}'")
     print(f"     export SERVER_NAME='{server_name}'")
     print()
     print(f"   Then:  python import_whatsapp_to_matrix.py --dry-run")
@@ -517,16 +531,12 @@ def save_progress(progress: dict, progress_file: Path):
 # Main import logic
 # ---------------------------------------------------------------------------
 
-def build_sender_map(owner_mxid: str, server_name: str,
-                     ghost_localpart: str) -> dict[str, str]:
-    """Map WhatsApp sender names to Matrix user IDs.
-
-    Both senders use ghost accounts since the appservice can only act
-    as users within its registered namespace.
-    """
+def build_sender_map(owner_name: str, owner_mxid: str,
+                     ghost_name: str, ghost_mxid: str) -> dict[str, str]:
+    """Map WhatsApp sender names to Matrix user IDs."""
     return {
-        "Malo Camaret": owner_mxid,
-        "~Hogan Laundry": f"@{ghost_localpart}:{server_name}",
+        owner_name: owner_mxid,
+        ghost_name: ghost_mxid,
     }
 
 
@@ -592,7 +602,7 @@ def do_dry_run(messages: list[dict], sender_map: dict[str, str],
 
 def do_import(messages: list[dict], sender_map: dict[str, str],
               args, ghost_mxid: str, ghost_localpart: str,
-              chat_dir: Path, progress_file: Path):
+              ghost_name: str, chat_dir: Path, progress_file: Path):
     """Send all messages to Matrix."""
     if not HAS_REQUESTS:
         sys.exit("Missing dependency: requests\n  pip install requests")
@@ -610,7 +620,7 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
     # Step 1: Register ghost user
     print("\n[1/4] Registering ghost user...")
     api.register_ghost(ghost_localpart)
-    api.set_displayname(ghost_mxid, "Hogan Laundry")
+    api.set_displayname(ghost_mxid, ghost_name)
 
     # Step 2: Create or reuse room
     room_id = args.room_id or progress.get("room_id")
@@ -622,7 +632,7 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
         # appservice can only act as users in its own namespace.
         room_id = api.create_room(
             creator_user_id=args.owner_mxid,
-            name="Hogan Laundry (WhatsApp Import)",
+            name=f"{ghost_name} (WhatsApp Import)",
             invite=[ghost_mxid],
         )
         api.join_room(room_id, ghost_mxid)
@@ -704,7 +714,7 @@ def main():
         server_name = args.server_name
         if not server_name:
             server_name = input("Enter your Matrix server name (e.g. example.com): ").strip()
-        generate_appservice_config(server_name, args.ghost_localpart)
+        generate_appservice_config(server_name, args.ghost_localpart, args.owner_mxid)
         return
 
     # Validate required args for non-dry-run
@@ -729,19 +739,40 @@ def main():
     messages = parse_chat(chat_file, tz_offset)
     print(f"Found {len(messages)} messages")
 
+    # Resolve sender names (auto-detect from chat if not provided)
+    senders = sorted(set(m["sender"] for m in messages))
+    owner_name = args.owner_name
+    ghost_name = args.ghost_name
+
+    if not owner_name or not ghost_name:
+        if len(senders) == 2:
+            if not owner_name and not ghost_name:
+                owner_name, ghost_name = senders[0], senders[1]
+                print(f"Auto-detected senders: owner={owner_name!r}, ghost={ghost_name!r}")
+                print("Use --owner-name / --ghost-name to override.")
+            elif not owner_name:
+                owner_name = [s for s in senders if s != ghost_name][0]
+            else:
+                ghost_name = [s for s in senders if s != owner_name][0]
+        else:
+            sys.exit(
+                f"Error: found {len(senders)} senders {senders}, expected 2.\n"
+                f"Specify --owner-name and --ghost-name explicitly."
+            )
+
     # Build sender map
     server_name = args.server_name or "example.com"
-    owner_mxid = args.owner_mxid or f"@malo:{server_name}"
+    owner_mxid = args.owner_mxid or f"@user:{server_name}"
     ghost_localpart = args.ghost_localpart
     ghost_mxid = f"@{ghost_localpart}:{server_name}"
 
-    sender_map = build_sender_map(owner_mxid, server_name, ghost_localpart)
+    sender_map = build_sender_map(owner_name, owner_mxid, ghost_name, ghost_mxid)
 
     if args.dry_run:
         do_dry_run(messages, sender_map, chat_dir)
     else:
         do_import(messages, sender_map, args, ghost_mxid, ghost_localpart,
-                  chat_dir, progress_file)
+                  ghost_name, chat_dir, progress_file)
 
 
 if __name__ == "__main__":
