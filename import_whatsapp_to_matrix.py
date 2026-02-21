@@ -20,6 +20,7 @@ Environment variables:
     SERVER_NAME       - Matrix server name (e.g. example.com)
     GHOST_LOCALPART   - Localpart for the ghost user (default: hogan_laundry)
     TIMEZONE          - Timezone for timestamps (default: Asia/Makassar)
+    CHAT_DIR          - Path to WhatsApp chat export folder (default: script directory)
 """
 
 from __future__ import annotations
@@ -53,8 +54,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CHAT_FILE = SCRIPT_DIR / "_chat.txt"
-PROGRESS_FILE = SCRIPT_DIR / "import_progress.json"
 
 # WhatsApp chat line pattern: [DD/MM/YYYY, HH:MM:SS] Sender: Message
 # Lines may start with Unicode LTR mark \u200e
@@ -123,6 +122,11 @@ def parse_args():
         "--room-id",
         default=os.environ.get("MATRIX_ROOM_ID"),
         help="Existing room ID to import into (skip room creation)"
+    )
+    parser.add_argument(
+        "--chat-dir",
+        default=os.environ.get("CHAT_DIR", str(SCRIPT_DIR)),
+        help="Path to WhatsApp chat export folder (default: script directory)"
     )
     return parser.parse_args()
 
@@ -499,14 +503,14 @@ rate_limited: false
 # Progress tracking
 # ---------------------------------------------------------------------------
 
-def load_progress() -> dict:
-    if PROGRESS_FILE.exists():
-        return json.loads(PROGRESS_FILE.read_text())
+def load_progress(progress_file: Path) -> dict:
+    if progress_file.exists():
+        return json.loads(progress_file.read_text())
     return {"sent_indices": [], "room_id": None}
 
 
-def save_progress(progress: dict):
-    PROGRESS_FILE.write_text(json.dumps(progress, indent=2))
+def save_progress(progress: dict, progress_file: Path):
+    progress_file.write_text(json.dumps(progress, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +545,8 @@ def get_image_info(file_path: Path) -> dict:
     return info
 
 
-def do_dry_run(messages: list[dict], sender_map: dict[str, str]):
+def do_dry_run(messages: list[dict], sender_map: dict[str, str],
+               chat_dir: Path):
     """Print parsed messages without sending to Matrix."""
     print(f"\nParsed {len(messages)} messages:\n")
     for i, msg in enumerate(messages):
@@ -564,7 +569,7 @@ def do_dry_run(messages: list[dict], sender_map: dict[str, str]):
             if len(lines) > 1:
                 print(f"            (+ {len(body.split(chr(10))) - 1} more lines)")
         if attach:
-            file_exists = (SCRIPT_DIR / attach).exists()
+            file_exists = (chat_dir / attach).exists()
             status = "OK" if file_exists else "MISSING"
             print(f"      attachment: {attach} [{status}]")
 
@@ -581,12 +586,13 @@ def do_dry_run(messages: list[dict], sender_map: dict[str, str]):
     print(f"Senders: {', '.join(senders)}")
     for m in attachments:
         fname = m["attachment"]
-        exists = (SCRIPT_DIR / fname).exists()
+        exists = (chat_dir / fname).exists()
         print(f"  Attachment: {fname} — {'found' if exists else 'NOT FOUND'}")
 
 
 def do_import(messages: list[dict], sender_map: dict[str, str],
-              args, ghost_mxid: str, ghost_localpart: str):
+              args, ghost_mxid: str, ghost_localpart: str,
+              chat_dir: Path, progress_file: Path):
     """Send all messages to Matrix."""
     if not HAS_REQUESTS:
         sys.exit("Missing dependency: requests\n  pip install requests")
@@ -599,7 +605,7 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
                  "Run with --generate-config to create the appservice registration.")
 
     api = MatrixAPI(args.homeserver_url, args.as_token)
-    progress = load_progress()
+    progress = load_progress(progress_file)
 
     # Step 1: Register ghost user
     print("\n[1/4] Registering ghost user...")
@@ -621,7 +627,7 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
         )
         api.join_room(room_id, ghost_mxid)
         progress["room_id"] = room_id
-        save_progress(progress)
+        save_progress(progress, progress_file)
 
     # Always set m.direct so re-runs fix the DM flag too
     api.set_direct_room(args.owner_mxid, ghost_mxid, room_id)
@@ -659,7 +665,7 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
 
         # Send attachment if present
         if msg["attachment"]:
-            file_path = SCRIPT_DIR / msg["attachment"]
+            file_path = chat_dir / msg["attachment"]
             if not file_path.exists():
                 print(f"  [{i}] Warning: attachment {msg['attachment']} not found, skipping")
             else:
@@ -678,13 +684,13 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
 
         sent_set.add(i)
         progress["sent_indices"] = sorted(sent_set)
-        save_progress(progress)
+        save_progress(progress, progress_file)
 
     # Step 4: Done
     print(f"\n[4/4] Import complete!")
     print(f"  Room: {room_id}")
     print(f"  Events sent: {event_count}")
-    print(f"  Progress saved to: {PROGRESS_FILE}")
+    print(f"  Progress saved to: {progress_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -712,10 +718,15 @@ def main():
             sys.exit(f"Error: missing required config: {', '.join(missing)}\n"
                      f"Set via CLI args or environment variables.")
 
+    # Resolve chat directory and derived paths
+    chat_dir = Path(args.chat_dir).resolve()
+    chat_file = chat_dir / "_chat.txt"
+    progress_file = chat_dir / "import_progress.json"
+
     # Parse chat
-    print(f"Parsing {CHAT_FILE}...")
+    print(f"Parsing {chat_file}...")
     tz_offset = get_tz_offset(args.timezone)
-    messages = parse_chat(CHAT_FILE, tz_offset)
+    messages = parse_chat(chat_file, tz_offset)
     print(f"Found {len(messages)} messages")
 
     # Build sender map
@@ -727,9 +738,10 @@ def main():
     sender_map = build_sender_map(owner_mxid, server_name, ghost_localpart)
 
     if args.dry_run:
-        do_dry_run(messages, sender_map)
+        do_dry_run(messages, sender_map, chat_dir)
     else:
-        do_import(messages, sender_map, args, ghost_mxid, ghost_localpart)
+        do_import(messages, sender_map, args, ghost_mxid, ghost_localpart,
+                  chat_dir, progress_file)
 
 
 if __name__ == "__main__":
