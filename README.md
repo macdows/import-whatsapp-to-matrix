@@ -4,9 +4,10 @@ Import a WhatsApp chat export into a Matrix room using the Application Service (
 
 ## Features
 
+- **End-to-end encrypted** by default (Megolm via matrix-nio's crypto engine)
 - Parses WhatsApp's `_chat.txt` export format (timestamps, senders, multiline messages)
 - Converts WhatsApp formatting (\*bold\*, \_italic\_, \~strikethrough\~) to HTML
-- Uploads image attachments as `m.image` events
+- Uploads image attachments as `m.image` events (encrypted client-side when E2EE is on)
 - Sets the room as a direct message in Element/clients
 - Resumable: tracks progress in `import_progress.json` so interrupted imports can continue
 - Idempotent message sending via deterministic transaction IDs
@@ -17,12 +18,18 @@ Import a WhatsApp chat export into a Matrix room using the Application Service (
 - Python 3.10+
 - A Matrix homeserver running [Synapse](https://github.com/element-hq/synapse)
 - An application service registered with the homeserver
+- `libolm` 3.x (required for E2EE)
 
-```
-pip install requests Pillow
+```bash
+# System dependency (for E2EE)
+brew install libolm          # macOS
+# apt install libolm-dev     # Debian/Ubuntu
+
+# Python dependencies
+pip install requests Pillow "matrix-nio[e2e]"
 ```
 
-(`Pillow` is optional — only needed for image dimension metadata.)
+`Pillow` is optional (only needed for image dimension metadata). `matrix-nio[e2e]` is optional if you use `--no-encryption`.
 
 ## Quick start
 
@@ -73,9 +80,14 @@ python import_whatsapp_to_matrix.py
 The script will:
 
 1. Register the ghost user (`@whatsapp_ghost:example.com`)
-2. Create a private DM room (or reuse an existing one)
-3. Send all messages with original timestamps
-4. Save progress after each message
+2. Create an encrypted private DM room (or reuse an existing one)
+3. Set up E2EE (login crypto devices, share Megolm sessions)
+4. Send all messages encrypted with original timestamps
+5. Export Megolm session keys to `megolm_keys.txt`
+
+After import, import the keys into Element: **Settings > Security & Privacy > Import E2E room keys** (passphrase: `import-whatsapp`).
+
+To skip encryption: `python import_whatsapp_to_matrix.py --no-encryption`
 
 ## Configuration
 
@@ -93,6 +105,7 @@ All options can be set via CLI flags or environment variables:
 | `--chat-dir` | `CHAT_DIR` | Script directory | Path to WhatsApp chat export folder |
 | `--owner-name` | `OWNER_NAME` | Auto-detected | WhatsApp display name of the room owner |
 | `--ghost-name` | `GHOST_NAME` | Auto-detected | WhatsApp display name of the other party |
+| `--no-encryption` | — | — | Send plaintext instead of E2EE |
 | `--dry-run` | — | — | Parse only, don't send |
 | `--fresh` | — | — | Delete progress and start a fresh import |
 | `--generate-config` | — | — | Print appservice YAML and exit |
@@ -103,9 +116,27 @@ Progress is saved to `import_progress.json` after each message. Re-running the s
 
 To start fresh, re-run with `--fresh` to delete the progress file and create a new room.
 
-## Note on encryption
+## End-to-end encryption
 
-Imported messages are **not end-to-end encrypted**, even if you normally use an encrypted Matrix room. The appservice API sends events server-side, bypassing client-side encryption. The created room has federation disabled but is otherwise a standard unencrypted room. Keep this in mind if your homeserver is shared or managed by a third party.
+By default, messages are **end-to-end encrypted** using Megolm (the same algorithm Matrix/Element uses). The script uses matrix-nio's crypto engine to encrypt message content client-side, then sends the encrypted payloads through the appservice API with original timestamps.
+
+**How it works:**
+
+1. Two temporary crypto devices are created (one per sender) and logged in via appservice auth
+2. Device keys are uploaded and Megolm group sessions are established
+3. Each message is encrypted with the sender's Megolm session before being sent
+4. Attachments are encrypted client-side (AES-CTR) and uploaded as `application/octet-stream`
+5. Session keys are exported to `megolm_keys.txt` for import into Element
+
+**Runtime artifacts** (created in the chat directory):
+
+- `.e2ee_store/` — nio crypto state (Olm accounts, Megolm sessions)
+- `nio_credentials.json` — device IDs and access tokens for the crypto devices
+- `megolm_keys.txt` — exported Megolm session keys
+
+**Re-runs** reuse the existing crypto state. To fully reset E2EE state, delete `.e2ee_store/` and `nio_credentials.json`.
+
+Use `--no-encryption` to send plaintext messages instead (no `libolm` or `matrix-nio` needed).
 
 ## Adapting for other chats
 

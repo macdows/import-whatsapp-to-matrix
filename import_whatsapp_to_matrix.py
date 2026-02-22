@@ -28,6 +28,7 @@ Environment variables:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import mimetypes
@@ -50,6 +51,13 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+try:
+    from nio import AsyncClient, AsyncClientConfig
+    from nio.crypto.attachments import encrypt_attachment
+    HAS_NIO = True
+except ImportError:
+    HAS_NIO = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -143,6 +151,10 @@ def parse_args():
         "--ghost-name",
         default=os.environ.get("GHOST_NAME"),
         help="WhatsApp display name of the other party (mapped to the ghost user)"
+    )
+    parser.add_argument(
+        "--no-encryption", action="store_true",
+        help="Send messages as plaintext (default: end-to-end encrypted)"
     )
     return parser.parse_args()
 
@@ -326,7 +338,7 @@ class MatrixAPI:
             print(f"  Warning: set displayname returned {resp.status_code}: {resp.text}")
 
     def create_room(self, creator_user_id: str, name: str | None = None,
-                    invite: list[str] = None) -> str:
+                    invite: list[str] = None, encrypted: bool = False) -> str:
         """Create a room as the given user. Returns room_id."""
         body = {
             "visibility": "private",
@@ -340,6 +352,12 @@ class MatrixAPI:
             body["name"] = name
         if invite:
             body["invite"] = invite
+        if encrypted:
+            body["initial_state"] = [{
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            }]
 
         resp = self._request(
             "POST", "/createRoom",
@@ -447,6 +465,254 @@ class MatrixAPI:
         resp.raise_for_status()
         return resp.json()["event_id"]
 
+    def send_encrypted_message(self, room_id: str, user_id: str, ts_ms: int,
+                               encrypted_content: dict) -> str:
+        """Send an m.room.encrypted event with a specific timestamp."""
+        txn_hash = hashlib.sha256(
+            f"{room_id}:{user_id}:{ts_ms}:{json.dumps(encrypted_content, sort_keys=True)}".encode()
+        ).hexdigest()[:16]
+
+        resp = self._request(
+            "PUT",
+            f"/rooms/{room_id}/send/m.room.encrypted/{txn_hash}",
+            params={
+                "user_id": user_id,
+                "ts": str(ts_ms),
+            },
+            json_body=encrypted_content,
+        )
+        resp.raise_for_status()
+        return resp.json()["event_id"]
+
+    def upload_data(self, data: bytes, filename: str, content_type: str,
+                    user_id: str) -> str:
+        """Upload raw bytes and return the mxc:// URI."""
+        url = f"{self.base}/_matrix/media/v3/upload"
+        resp = self.session.post(
+            url,
+            params={"filename": filename, "user_id": user_id},
+            data=data,
+            headers={
+                "Content-Type": content_type,
+                "Authorization": f"Bearer {self.as_token}",
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        mxc_uri = resp.json()["content_uri"]
+        print(f"  Uploaded {filename} → {mxc_uri}")
+        return mxc_uri
+
+    def ensure_room_encrypted(self, room_id: str, user_id: str) -> None:
+        """Send m.room.encryption state event if room isn't already encrypted."""
+        resp = self._request(
+            "GET", f"/rooms/{room_id}/state/m.room.encryption",
+            params={"user_id": user_id},
+        )
+        if resp.status_code == 200:
+            print(f"  Room {room_id} already has encryption enabled")
+            return
+
+        resp = self._request(
+            "PUT", f"/rooms/{room_id}/state/m.room.encryption/",
+            params={"user_id": user_id},
+            json_body={"algorithm": "m.megolm.v1.aes-sha2"},
+        )
+        resp.raise_for_status()
+        print(f"  Enabled encryption for room {room_id}")
+
+
+# ---------------------------------------------------------------------------
+# E2EE helper (matrix-nio crypto engine)
+# ---------------------------------------------------------------------------
+
+class E2EEHelper:
+    """Manages matrix-nio crypto clients for Megolm encryption.
+
+    Creates two AsyncClient instances (owner + ghost) used only for their
+    crypto engine — actual events are sent via the appservice MatrixAPI.
+    Exposes synchronous methods backed by a private asyncio event loop.
+    """
+
+    def __init__(self, homeserver_url: str, as_token: str,
+                 owner_mxid: str, ghost_mxid: str, chat_dir: str | Path):
+        self.homeserver_url = homeserver_url
+        self.as_token = as_token
+        self.owner_mxid = owner_mxid
+        self.ghost_mxid = ghost_mxid
+        self.chat_dir = Path(chat_dir)
+        self.store_dir = self.chat_dir / ".e2ee_store"
+        self.creds_file = self.chat_dir / "nio_credentials.json"
+        self.clients: dict[str, AsyncClient] = {}
+        self._loop = asyncio.new_event_loop()
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _run(self, coro):
+        return self._loop.run_until_complete(coro)
+
+    def _load_credentials(self) -> dict:
+        if self.creds_file.exists():
+            return json.loads(self.creds_file.read_text())
+        return {}
+
+    def _save_credentials(self, creds: dict):
+        self.creds_file.write_text(json.dumps(creds, indent=2))
+
+    def _appservice_login(self, user_id: str) -> tuple[str, str]:
+        """POST /login with m.login.application_service → (access_token, device_id)."""
+        resp = requests.post(
+            f"{self.homeserver_url}/_matrix/client/v3/login",
+            json={
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": user_id},
+            },
+            headers={"Authorization": f"Bearer {self.as_token}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["access_token"], data["device_id"]
+
+    async def _init_client(self, user_id: str) -> AsyncClient:
+        """Create or restore a nio AsyncClient for one user."""
+        localpart = user_id.split(":")[0].lstrip("@")
+        store_path = str(self.store_dir / localpart)
+        os.makedirs(store_path, exist_ok=True)
+
+        config = AsyncClientConfig(
+            encryption_enabled=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            self.homeserver_url,
+            user=user_id,
+            store_path=store_path,
+            config=config,
+        )
+
+        creds = self._load_credentials()
+        if user_id in creds:
+            client.restore_login(
+                user_id=user_id,
+                device_id=creds[user_id]["device_id"],
+                access_token=creds[user_id]["access_token"],
+            )
+            print(f"  Restored nio login for {user_id} "
+                  f"(device {creds[user_id]['device_id']})")
+        else:
+            access_token, device_id = self._appservice_login(user_id)
+            client.restore_login(
+                user_id=user_id,
+                device_id=device_id,
+                access_token=access_token,
+            )
+            creds[user_id] = {
+                "access_token": access_token,
+                "device_id": device_id,
+            }
+            self._save_credentials(creds)
+            print(f"  Logged in {user_id} via appservice (device {device_id})")
+
+        # Upload identity + one-time keys
+        keys_resp = await client.keys_upload()
+        print(f"  Keys upload for {user_id}: {type(keys_resp).__name__}")
+
+        self.clients[user_id] = client
+        return client
+
+    # -- public synchronous API ---------------------------------------------
+
+    def initialize(self, room_id: str):
+        """Login both clients, sync, share group sessions."""
+        self._run(self._initialize(room_id))
+
+    async def _initialize(self, room_id: str):
+        print("  Initializing E2EE crypto engine...")
+
+        await self._init_client(self.owner_mxid)
+        await self._init_client(self.ghost_mxid)
+
+        # Minimal sync to discover room state & members
+        sync_filter = json.dumps({
+            "room": {
+                "rooms": [room_id],
+                "timeline": {"limit": 1},
+            },
+            "presence": {"not_types": ["*"]},
+            "account_data": {"not_types": ["*"]},
+        })
+
+        for mxid, client in self.clients.items():
+            resp = await client.sync(timeout=30000, sync_filter=sync_filter)
+            print(f"  Sync for {mxid}: {type(resp).__name__}")
+
+        # Ensure device keys for room members are available
+        for mxid, client in self.clients.items():
+            resp = await client.keys_query()
+            print(f"  Keys query for {mxid}: {type(resp).__name__}")
+
+        # Create outbound Megolm sessions & share inbound keys via to-device
+        for mxid, client in self.clients.items():
+            try:
+                resp = await client.share_group_session(
+                    room_id, ignore_unverified_devices=True,
+                )
+                print(f"  Shared group session for {mxid}: "
+                      f"{type(resp).__name__}")
+            except Exception as e:
+                print(f"  Warning: share_group_session for {mxid}: {e}")
+
+        # Sync again so each client receives the other's shared keys
+        for mxid, client in self.clients.items():
+            await client.sync(timeout=10000, sync_filter=sync_filter)
+
+        print("  E2EE initialized")
+
+    def encrypt_message(self, room_id: str, sender_mxid: str,
+                        content: dict) -> dict:
+        """Encrypt a plaintext m.room.message content dict → m.room.encrypted payload."""
+        return self._run(self._encrypt_message(room_id, sender_mxid, content))
+
+    async def _encrypt_message(self, room_id: str, sender_mxid: str,
+                               content: dict) -> dict:
+        client = self.clients[sender_mxid]
+
+        plaintext = {
+            "type": "m.room.message",
+            "content": content,
+            "room_id": room_id,
+        }
+
+        try:
+            encrypted = client.olm.group_encrypt(room_id, plaintext)
+        except Exception:
+            # Outbound session may be missing — create & retry
+            await client.share_group_session(
+                room_id, ignore_unverified_devices=True,
+            )
+            encrypted = client.olm.group_encrypt(room_id, plaintext)
+
+        return encrypted
+
+    def encrypt_file(self, file_data: bytes) -> tuple[bytes, dict]:
+        """Encrypt file bytes for upload. Returns (ciphertext, file_keys)."""
+        return encrypt_attachment(file_data)
+
+    def export_keys(self, output_path: str | Path, passphrase: str = "import-whatsapp"):
+        """Export all inbound Megolm session keys (for import into Element)."""
+        self._run(self._export_keys(output_path, passphrase))
+
+    async def _export_keys(self, output_path, passphrase):
+        client = self.clients[self.owner_mxid]
+        await client.export_keys(str(output_path), passphrase)
+        print(f"  Exported Megolm session keys → {output_path}")
+
+    def close(self):
+        for client in self.clients.values():
+            self._run(client.close())
+        self._loop.close()
+
 
 # ---------------------------------------------------------------------------
 # Appservice config generation
@@ -458,6 +724,7 @@ def generate_appservice_config(server_name: str, ghost_localpart: str,
     as_token = secrets.token_hex(32)
     hs_token = secrets.token_hex(32)
 
+    escaped_server = server_name.replace(".", "\\\\.")
     owner_localpart = owner_mxid.split(":")[0].lstrip("@") if owner_mxid else "USER"
     yaml_content = f"""# Application Service registration for WhatsApp import
 # Place this file on your server and register it with Synapse
@@ -470,9 +737,9 @@ sender_localpart: _whatsapp_import
 namespaces:
   users:
     - exclusive: false
-      regex: "@{owner_localpart}:{server_name}"
+      regex: '@{owner_localpart}:{escaped_server}'
     - exclusive: true
-      regex: "@{ghost_localpart}:{server_name}"
+      regex: '@{ghost_localpart}:{escaped_server}'
   rooms: []
   aliases: []
 rate_limited: false
@@ -506,7 +773,12 @@ rate_limited: false
     print("3. Re-run the playbook:")
     print("     just run-tags setup-synapse,start")
     print()
-    print("4. Set the environment variable and run this script:")
+    print("4. Install E2EE dependencies (for encrypted import):")
+    print("     brew install libolm          # macOS")
+    print("     # apt install libolm-dev     # Debian/Ubuntu")
+    print('     pip install "matrix-nio[e2e]"')
+    print()
+    print("5. Set the environment variable and run this script:")
     print(f"     export MATRIX_AS_TOKEN='{as_token}'")
     print(f"     export HOMESERVER_URL='https://matrix.YOURDOMAIN.com'")
     print(f"     export OWNER_MXID='@{owner_localpart}:{server_name}'")
@@ -514,6 +786,7 @@ rate_limited: false
     print()
     print(f"   Then:  python import_whatsapp_to_matrix.py --dry-run")
     print(f"   Then:  python import_whatsapp_to_matrix.py")
+    print(f"   (add --no-encryption to skip E2EE)")
     print()
 
 
@@ -618,25 +891,36 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
                  "Set it via --as-token or the MATRIX_AS_TOKEN env var.\n"
                  "Run with --generate-config to create the appservice registration.")
 
+    use_encryption = not args.no_encryption
+    if use_encryption and not HAS_NIO:
+        sys.exit("Missing dependency for E2EE: matrix-nio[e2e]\n"
+                 '  pip install "matrix-nio[e2e]"\n'
+                 "  Also requires libolm 3.x (brew install libolm)\n"
+                 "  Or run with --no-encryption to skip E2EE.")
+
     api = MatrixAPI(args.homeserver_url, args.as_token)
     progress = load_progress(progress_file)
+    e2ee = None
+
+    total_steps = 5 if use_encryption else 4
 
     # Step 1: Register ghost user
-    print("\n[1/4] Registering ghost user...")
+    print(f"\n[1/{total_steps}] Registering ghost user...")
     api.register_ghost(ghost_localpart)
     api.set_displayname(ghost_mxid, ghost_name)
 
     # Step 2: Create or reuse room
     room_id = args.room_id or progress.get("room_id")
     if room_id:
-        print(f"\n[2/4] Using existing room: {room_id}")
+        print(f"\n[2/{total_steps}] Using existing room: {room_id}")
+        if use_encryption:
+            api.ensure_room_encrypted(room_id, args.owner_mxid)
     else:
-        print("\n[2/4] Creating room...")
-        # Ghost creates the room and invites the owner, since the
-        # appservice can only act as users in its own namespace.
+        print(f"\n[2/{total_steps}] Creating room...")
         room_id = api.create_room(
             creator_user_id=args.owner_mxid,
             invite=[ghost_mxid],
+            encrypted=use_encryption,
         )
         api.join_room(room_id, ghost_mxid)
         progress["room_id"] = room_id
@@ -645,8 +929,19 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
     # Always set m.direct so re-runs fix the DM flag too
     api.set_direct_room(args.owner_mxid, ghost_mxid, room_id)
 
-    # Step 3: Send messages
-    print(f"\n[3/4] Sending {len(messages)} messages...")
+    # Step 3: Initialize E2EE (if enabled)
+    if use_encryption:
+        print(f"\n[3/{total_steps}] Setting up end-to-end encryption...")
+        e2ee = E2EEHelper(
+            args.homeserver_url, args.as_token,
+            args.owner_mxid, ghost_mxid, chat_dir,
+        )
+        e2ee.initialize(room_id)
+
+    # Step N: Send messages
+    msg_step = 4 if use_encryption else 3
+    mode = "encrypted" if use_encryption else "plaintext"
+    print(f"\n[{msg_step}/{total_steps}] Sending {len(messages)} messages ({mode})...")
     sent_set = set(progress.get("sent_indices", []))
     event_count = 0
 
@@ -672,7 +967,12 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
                 content["format"] = "org.matrix.custom.html"
                 content["formatted_body"] = html
 
-            event_id = api.send_message(room_id, mxid, ts_ms, content)
+            if e2ee:
+                encrypted = e2ee.encrypt_message(room_id, mxid, content)
+                event_id = api.send_encrypted_message(
+                    room_id, mxid, ts_ms, encrypted)
+            else:
+                event_id = api.send_message(room_id, mxid, ts_ms, content)
             event_count += 1
             print(f"  [{i}] text from {msg['sender'][:20]} → {event_id}")
 
@@ -680,18 +980,42 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
         if msg["attachment"]:
             file_path = chat_dir / msg["attachment"]
             if not file_path.exists():
-                print(f"  [{i}] Warning: attachment {msg['attachment']} not found, skipping")
+                print(f"  [{i}] Warning: attachment {msg['attachment']} "
+                      f"not found, skipping")
             else:
-                mxc_uri = api.upload_file(file_path, mxid)
                 img_info = get_image_info(file_path)
+                content_type = img_info.get("mimetype", "application/octet-stream")
 
-                content = {
-                    "msgtype": "m.image",
-                    "body": msg["attachment"],
-                    "url": mxc_uri,
-                    "info": img_info,
-                }
-                event_id = api.send_message(room_id, mxid, ts_ms, content)
+                if e2ee:
+                    # Encrypt file client-side, upload as octet-stream
+                    plaintext_data = file_path.read_bytes()
+                    ciphertext, file_keys = e2ee.encrypt_file(plaintext_data)
+                    mxc_uri = api.upload_data(
+                        ciphertext, msg["attachment"],
+                        "application/octet-stream", mxid,
+                    )
+                    content = {
+                        "msgtype": "m.image",
+                        "body": msg["attachment"],
+                        "info": img_info,
+                        "file": {
+                            "url": mxc_uri,
+                            "mimetype": content_type,
+                            **file_keys,
+                        },
+                    }
+                    encrypted = e2ee.encrypt_message(room_id, mxid, content)
+                    event_id = api.send_encrypted_message(
+                        room_id, mxid, ts_ms, encrypted)
+                else:
+                    mxc_uri = api.upload_file(file_path, mxid)
+                    content = {
+                        "msgtype": "m.image",
+                        "body": msg["attachment"],
+                        "url": mxc_uri,
+                        "info": img_info,
+                    }
+                    event_id = api.send_message(room_id, mxid, ts_ms, content)
                 event_count += 1
                 print(f"  [{i}] image from {msg['sender'][:20]} → {event_id}")
 
@@ -699,11 +1023,30 @@ def do_import(messages: list[dict], sender_map: dict[str, str],
         progress["sent_indices"] = sorted(sent_set)
         save_progress(progress, progress_file)
 
-    # Step 4: Done
-    print(f"\n[4/4] Import complete!")
+    # Final step: Done (+ key export for E2EE)
+    done_step = total_steps
+    print(f"\n[{done_step}/{total_steps}] Import complete!")
     print(f"  Room: {room_id}")
     print(f"  Events sent: {event_count}")
     print(f"  Progress saved to: {progress_file}")
+
+    if e2ee:
+        keys_file = chat_dir / "megolm_keys.txt"
+        passphrase = "import-whatsapp"
+        e2ee.export_keys(keys_file, passphrase)
+        e2ee.close()
+        print()
+        print("  E2EE KEY EXPORT")
+        print("  " + "-" * 40)
+        print(f"  Keys file: {keys_file}")
+        print(f"  Passphrase: {passphrase}")
+        print()
+        print("  To decrypt messages in Element:")
+        print("  1. Open Element → Settings → Security & Privacy")
+        print("  2. Click 'Import E2E room keys'")
+        print(f"  3. Select: {keys_file}")
+        print(f"  4. Enter passphrase: {passphrase}")
+        print("  5. Messages should now show with a lock icon")
 
 
 # ---------------------------------------------------------------------------
